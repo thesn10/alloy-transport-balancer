@@ -8,8 +8,8 @@
 //! ```
 
 use alloy_transport_balancer::{
-    BalancerConfig, EndpointConfig, HttpClientConfig, LoadBalancedTransport, ThrottleConfig, Weight,
-    reqwest::Url,
+    BalancerConfig, EndpointConfig, HttpClientConfig, LoadBalancedTransport, ThrottleConfig,
+    Weight, reqwest::Url,
 };
 use std::time::Duration;
 
