@@ -42,6 +42,8 @@ mod batching;
 #[cfg(feature = "balancer")]
 mod client_pool;
 #[cfg(feature = "balancer")]
+mod compute_units;
+#[cfg(feature = "balancer")]
 mod request_rate;
 #[cfg(feature = "balancer")]
 mod throttle;
@@ -50,6 +52,11 @@ mod throttle;
 pub use batching::{BatchingConfig, BatchingTransport};
 #[cfg(feature = "balancer")]
 pub use client_pool::{HttpClientConfig, set_default_http_client_config};
+#[cfg(feature = "balancer")]
+pub use compute_units::{
+    ALCHEMY_THROUGHPUT_WINDOW, ALCHEMY_UNLISTED_METHOD_UNITS, ComputeUnitBudget,
+    ComputeUnitBudgetSnapshot, ComputeUnitCost,
+};
 #[cfg(feature = "balancer")]
 pub use throttle::{
     DomainThrottleSnapshot, DomainThrottleState, ThrottleConfig, domain_throttle,
@@ -67,7 +74,10 @@ use alloy_transport_http::Http;
 #[cfg(feature = "balancer")]
 use client_pool::shared_client_for_domain;
 #[cfg(feature = "balancer")]
-use request_rate::{RequestRateFallback, RequestRateLimiter, RequestRateReservation};
+use request_rate::{
+    Demand, Denial, LimitKind, REQUEST_RATE_WINDOW, RequestRateFallback, RequestRateLimiter,
+    RequestRateReservation, check_all, try_reserve_all,
+};
 #[cfg(feature = "balancer")]
 use reqwest::Url;
 use std::fmt;
@@ -341,11 +351,12 @@ impl From<u32> for Weight {
 
 /// Per-endpoint routing capabilities.
 ///
-/// Request-size, in-flight, and request-rate limits let a heterogeneous provider
-/// pool keep a low-throughput fallback available without sending it work it
-/// cannot accept.
+/// Request-size, in-flight, request-rate, and compute-unit limits let a
+/// heterogeneous provider pool keep a low-throughput fallback available without
+/// sending it work it cannot accept.
 #[derive(Clone, Debug)]
 #[cfg(feature = "balancer")]
+#[non_exhaustive]
 pub struct EndpointConfig {
     /// Stable provider identity used for source-aware follow-up routing.
     pub id: Option<EndpointId>,
@@ -362,6 +373,9 @@ pub struct EndpointConfig {
     /// Maximum JSON-RPC calls admitted to this endpoint in any rolling second.
     /// A batch consumes one unit per member. `None` leaves the rate unrestricted.
     pub max_requests_per_second: Option<u32>,
+    /// Compute-unit budget this endpoint draws from, possibly shared with other
+    /// endpoints. `None` leaves compute units unmetered.
+    pub compute_unit_budget: Option<ComputeUnitBudget>,
     /// Whether this provider pair is expected to expose a complete Flashblocks
     /// feed and matching preconfirmed state.
     pub flashblocks: bool,
@@ -378,6 +392,7 @@ impl EndpointConfig {
             max_request_bytes: None,
             max_in_flight: None,
             max_requests_per_second: None,
+            compute_unit_budget: None,
             flashblocks: false,
         }
     }
@@ -413,6 +428,17 @@ impl EndpointConfig {
     /// another eligible endpoint before waiting for capacity.
     pub const fn with_max_requests_per_second(mut self, limit: u32) -> Self {
         self.max_requests_per_second = Some(limit);
+        self
+    }
+
+    /// Charge every call sent to this endpoint against `budget`, in addition to
+    /// any request-rate limit.
+    ///
+    /// Clones of one budget share its capacity, so endpoints of one provider
+    /// account can hold the same budget. When it is exhausted, balanced and
+    /// preferred routes try another eligible endpoint before waiting for capacity.
+    pub fn with_compute_unit_budget(mut self, budget: ComputeUnitBudget) -> Self {
+        self.compute_unit_budget = Some(budget);
         self
     }
 }
@@ -554,6 +580,7 @@ impl LoadBalancedTransportBuilder {
         let mut request_caps = Vec::with_capacity(self.endpoints.len());
         let mut in_flight_limits = Vec::with_capacity(self.endpoints.len());
         let mut request_rate_limits = Vec::with_capacity(self.endpoints.len());
+        let mut compute_unit_budgets = Vec::with_capacity(self.endpoints.len());
         let mut endpoint_ids = Vec::with_capacity(self.endpoints.len());
         let mut endpoint_flashblocks = Vec::with_capacity(self.endpoints.len());
         let mut endpoint_index_by_id = HashMap::new();
@@ -568,6 +595,7 @@ impl LoadBalancedTransportBuilder {
                 max_request_bytes,
                 max_in_flight,
                 max_requests_per_second,
+                compute_unit_budget,
                 flashblocks,
             } = endpoint;
             assert!(weight.0 > 0, "endpoint weight must be > 0");
@@ -617,9 +645,14 @@ impl LoadBalancedTransportBuilder {
             transports.push(Http::with_client(client, url));
             request_caps.push(max_request_bytes);
             in_flight_limits.push(max_in_flight.map(|limit| Arc::new(Semaphore::new(limit))));
-            request_rate_limits.push(
-                max_requests_per_second.map(|limit| Arc::new(RequestRateLimiter::new(limit))),
-            );
+            request_rate_limits.push(max_requests_per_second.map(|limit| {
+                Arc::new(RequestRateLimiter::new(
+                    LimitKind::RequestRate,
+                    limit,
+                    REQUEST_RATE_WINDOW,
+                ))
+            }));
+            compute_unit_budgets.push(compute_unit_budget);
             endpoint_ids.push(id);
             endpoint_flashblocks.push(flashblocks);
         }
@@ -635,6 +668,7 @@ impl LoadBalancedTransportBuilder {
             endpoint_request_caps: Arc::new(request_caps),
             endpoint_in_flight: Arc::new(in_flight_limits),
             endpoint_request_rate_limits: Arc::new(request_rate_limits),
+            endpoint_compute_unit_budgets: Arc::new(compute_unit_budgets),
             endpoint_ids: Arc::new(endpoint_ids),
             endpoint_flashblocks: Arc::new(endpoint_flashblocks),
             endpoint_index_by_id: Arc::new(endpoint_index_by_id),
@@ -678,6 +712,8 @@ pub struct LoadBalancedTransport {
     endpoint_in_flight: Arc<Vec<Option<Arc<Semaphore>>>>,
     /// Optional rolling one-second JSON-RPC admission limits.
     endpoint_request_rate_limits: Arc<Vec<Option<Arc<RequestRateLimiter>>>>,
+    /// Optional compute-unit budgets, possibly shared between endpoints.
+    endpoint_compute_unit_budgets: Arc<Vec<Option<ComputeUnitBudget>>>,
     /// Stable operator identities, when configured.
     endpoint_ids: Arc<Vec<Option<EndpointId>>>,
     /// Provider-level Flashblocks declarations.
@@ -700,7 +736,7 @@ pub struct LoadBalancedTransport {
 
 /// A pinned Flashblocks-capable transport and its provider identity.
 ///
-/// The lease shares connection pools, request-rate capacity, and throttle state
+/// The lease shares connection pools, request-rate and compute-unit capacity, and throttle state
 /// with the parent balancer, but its transport never fails over to another
 /// endpoint.
 #[derive(Clone)]
@@ -750,7 +786,8 @@ impl LoadBalancedTransport {
     /// # Errors
     ///
     /// The transport retries automatically on 413, 429, 502, 503, 504, connection
-    /// failures, and timeouts. Non-retryable errors (400, 401, JSON-RPC errors)
+    /// failures, timeouts, and packets whose every response is a JSON-RPC error
+    /// with code 429. Non-retryable errors (400, 401, other JSON-RPC errors)
     /// are returned immediately. After `max_retry_rounds` full rotations through
     /// all endpoints, the last retryable error is returned to the caller.
     pub fn new(endpoints: Vec<(Url, Weight)>) -> Self {
@@ -963,26 +1000,24 @@ impl LoadBalancedTransport {
         self.endpoint_request_caps[index].is_none_or(|limit| request_bytes <= limit)
     }
 
-    fn log_request_rate_denial(
-        &self,
-        index: usize,
-        request_units: u32,
-        reservation: RequestRateReservation,
-    ) {
+    fn log_admission_denial(&self, index: usize, denial: &Denial<'_>) {
         let endpoint_id = self.endpoint_ids[index]
             .as_ref()
             .map_or("<anonymous>", EndpointId::as_str);
-        match reservation {
+        let limit = denial.limiter.kind().as_str();
+        let units = denial.units;
+        match denial.reservation {
             RequestRateReservation::Admitted => {}
             RequestRateReservation::RetryAfter(retry_after) => debug!(
                 endpoint_id,
-                request_units,
+                limit,
+                units,
                 retry_after_ms = retry_after.as_millis() as u64,
-                "RPC endpoint request-rate capacity unavailable"
+                "RPC endpoint admission capacity unavailable"
             ),
             RequestRateReservation::PacketTooLarge => debug!(
                 endpoint_id,
-                request_units, "JSON-RPC packet exceeds endpoint request-rate capacity"
+                limit, units, "JSON-RPC packet exceeds endpoint admission capacity"
             ),
         }
     }
@@ -1058,6 +1093,62 @@ impl LoadBalancedTransport {
             false
         }
     }
+
+    /// The endpoint's own request-rate limit first, then its shared budget, as
+    /// [`try_reserve_all`] requires.
+    fn admission_demands<'a>(
+        &'a self,
+        index: usize,
+        req: &RequestPacket,
+        request_calls: u32,
+    ) -> Vec<Demand<'a>> {
+        let request_rate = self.endpoint_request_rate_limits[index]
+            .as_ref()
+            .map(|limiter| Demand {
+                limiter,
+                units: request_calls,
+            });
+        let compute_units = self.endpoint_compute_unit_budgets[index]
+            .as_ref()
+            .map(|budget| Demand {
+                limiter: budget.limiter(),
+                units: budget.packet_units(req.method_names()),
+            });
+        request_rate.into_iter().chain(compute_units).collect()
+    }
+}
+
+/// JSON-RPC error code providers such as Alchemy return, with HTTP 200, when a
+/// call exceeds the throughput limit.
+#[cfg(feature = "balancer")]
+const JSON_RPC_RATE_LIMIT_CODE: i64 = 429;
+
+#[cfg(feature = "balancer")]
+const fn is_rate_limit_payload(error: &alloy_json_rpc::ErrorPayload) -> bool {
+    error.code == JSON_RPC_RATE_LIMIT_CODE
+}
+
+/// Turns a packet whose every response is a rate-limit error into a retryable
+/// 429 transport error; a packet with other responses is kept, since retrying it
+/// would repeat the calls that succeeded.
+#[cfg(feature = "balancer")]
+fn reject_rate_limited_packet(resp: ResponsePacket) -> Result<ResponsePacket, TransportError> {
+    let fully_rate_limited = match &resp {
+        ResponsePacket::Single(single) => single.error_code() == Some(JSON_RPC_RATE_LIMIT_CODE),
+        ResponsePacket::Batch(batch) => {
+            !batch.is_empty()
+                && batch
+                    .iter()
+                    .all(|single| single.error_code() == Some(JSON_RPC_RATE_LIMIT_CODE))
+        }
+    };
+    if fully_rate_limited {
+        let message = resp.first_error_message().unwrap_or_default();
+        return Err(TransportErrorKind::custom_str(&format!(
+            "429 Too Many Requests (JSON-RPC error {JSON_RPC_RATE_LIMIT_CODE}): {message}"
+        )));
+    }
+    Ok(resp)
 }
 
 #[cfg(feature = "balancer")]
@@ -1076,7 +1167,7 @@ impl Service<RequestPacket> for LoadBalancedTransport {
             let request_bytes = serde_json::to_vec(&req)
                 .map(|serialized| serialized.len())
                 .unwrap_or(usize::MAX);
-            let request_units = u32::try_from(req.len().max(1)).unwrap_or(u32::MAX);
+            let request_calls = u32::try_from(req.len().max(1)).unwrap_or(u32::MAX);
             let mut candidates = this.candidate_indices(request_bytes);
             if candidates.is_empty() {
                 return Err(TransportErrorKind::custom_str(
@@ -1104,12 +1195,11 @@ impl Service<RequestPacket> for LoadBalancedTransport {
                     let mut rate_fallback = RequestRateFallback::default();
 
                     for (attempt, &idx) in candidates.iter().enumerate() {
-                        if let Some(rate_limit) = &this.endpoint_request_rate_limits[idx] {
-                            let reservation = rate_limit.check(request_units);
-                            if rate_fallback.rejects(rate_limit, reservation) {
-                                this.log_request_rate_denial(idx, request_units, reservation);
-                                continue;
-                            }
+                        let demands = this.admission_demands(idx, &req, request_calls);
+                        if let Some(denial) = check_all(&demands) {
+                            rate_fallback.reject(&denial);
+                            this.log_admission_denial(idx, &denial);
+                            continue;
                         }
 
                         // Cross-thread domain throttle: skip heavily-throttled
@@ -1145,20 +1235,26 @@ impl Service<RequestPacket> for LoadBalancedTransport {
                             ),
                             None => None,
                         };
-                        if let Some(rate_limit) = &this.endpoint_request_rate_limits[idx] {
-                            let reservation = rate_limit.try_reserve(request_units);
-                            if rate_fallback.rejects(rate_limit, reservation) {
-                                this.log_request_rate_denial(idx, request_units, reservation);
-                                drop(permit);
-                                continue;
-                            }
+                        if let Some(denial) = try_reserve_all(&demands, u64::from(request_calls)) {
+                            rate_fallback.reject(&denial);
+                            this.log_admission_denial(idx, &denial);
+                            drop(permit);
+                            continue;
                         }
                         let mut transport = this.endpoints[idx].clone();
                         rate_fallback.record_rollovers();
 
-                        match transport.call(req.clone()).await {
+                        match transport
+                            .call(req.clone())
+                            .await
+                            .and_then(reject_rate_limited_packet)
+                        {
                             Ok(resp) => {
-                                record_success(throttle);
+                                if resp.iter_errors().any(is_rate_limit_payload) {
+                                    record_rate_limit(throttle);
+                                } else {
+                                    record_success(throttle);
+                                }
                                 return Ok(resp);
                             }
                             Err(err) => {
@@ -1197,16 +1293,16 @@ impl Service<RequestPacket> for LoadBalancedTransport {
                         if let Some((retry_after, rate_limit)) = rate_fallback.earliest_capacity() {
                             rate_limit.record_wait();
                             debug!(
-                                request_units,
+                                request_calls,
                                 retry_after_ms = retry_after.as_millis() as u64,
-                                "all eligible RPC endpoints lack request-rate capacity; waiting"
+                                "all eligible RPC endpoints lack request-rate or compute-unit capacity; waiting"
                             );
                             sleep(retry_after).await;
                             continue;
                         }
                         if rate_fallback.packets_too_large() == candidates.len() {
                             return Err(TransportErrorKind::custom_str(
-                                "JSON-RPC packet exceeds every endpoint request-rate capacity allowed by the routing policy",
+                                "JSON-RPC packet exceeds every endpoint request-rate or compute-unit capacity allowed by the routing policy",
                             ));
                         }
                     }
@@ -1266,7 +1362,15 @@ mod tests {
     }
 
     fn fixed_http_server(bodies: Vec<&'static str>) -> (Url, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        fixed_http_server_on("127.0.0.1", bodies)
+    }
+
+    /// Loopback hosts `127.0.0.N` form their own throttle domain (`0.N`).
+    fn fixed_http_server_on(
+        host: &str,
+        bodies: Vec<&'static str>,
+    ) -> (Url, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((host, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let handle = thread::spawn(move || {
             for body in bodies {
@@ -1852,7 +1956,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("exceeds every endpoint request-rate capacity")
+                .contains("exceeds every endpoint request-rate or compute-unit capacity")
         );
         let snapshot = transport.endpoint_request_rate_snapshot().pop().unwrap();
         assert_eq!(snapshot.total_admitted_rpc_calls, 0);
@@ -2084,5 +2188,242 @@ mod tests {
             &transport.endpoint_throttles[0],
             &transport.endpoint_throttles[2]
         ));
+    }
+
+    fn rpc_call(method: &str, id: u64) -> alloy_json_rpc::SerializedRequest {
+        alloy_json_rpc::Request::new(method.to_owned(), Id::Number(id), ())
+            .serialize()
+            .unwrap()
+    }
+
+    /// Reads the transport's own throttle state, which survives `reset_registry`
+    /// running in parallel tests.
+    fn recorded_rate_limits(transport: &LoadBalancedTransport) -> u64 {
+        transport.endpoint_throttles[0].total_rate_limits()
+    }
+
+    fn eth_call_budget(units_per_second: u32) -> ComputeUnitBudget {
+        ComputeUnitBudget::new(
+            ComputeUnitCost::Alchemy,
+            units_per_second,
+            Duration::from_secs(1),
+        )
+    }
+
+    #[tokio::test]
+    async fn compute_unit_budget_charges_units_while_request_rate_counts_calls() {
+        let (url, server) =
+            one_shot_http_server("200 OK", r#"{"jsonrpc":"2.0","id":30,"result":"0x"}"#);
+        let budget = eth_call_budget(100);
+        let mut transport = LoadBalancedTransport::builder_with_endpoints(vec![
+            EndpointConfig::new(url, Weight(1))
+                .with_max_requests_per_second(10)
+                .with_compute_unit_budget(budget.clone()),
+        ])
+        .build();
+
+        transport
+            .call(RequestPacket::Single(rpc_call("eth_call", 30)))
+            .await
+            .unwrap();
+
+        let requests = transport.endpoint_request_rate_snapshot().pop().unwrap();
+        assert_eq!(requests.used_in_rolling_window, 1);
+        assert_eq!(requests.remaining_in_rolling_window, 9);
+        assert_eq!(requests.total_admitted_rpc_calls, 1);
+        let units = budget.snapshot();
+        assert_eq!(units.used_in_window, 26);
+        assert_eq!(units.remaining_in_window, 74);
+        assert_eq!(units.total_admitted_units, 26);
+        assert_eq!(units.total_admitted_rpc_calls, 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_above_compute_unit_capacity_fails_without_network_io() {
+        let budget = eth_call_budget(50);
+        let mut transport = LoadBalancedTransport::builder_with_endpoints(vec![
+            EndpointConfig::new(Url::parse("http://127.0.0.1:1").unwrap(), Weight(1))
+                .with_max_requests_per_second(10)
+                .with_compute_unit_budget(budget.clone()),
+        ])
+        .build();
+
+        let error = transport
+            .call(RequestPacket::Batch(vec![
+                rpc_call("eth_call", 31),
+                rpc_call("eth_call", 32),
+            ]))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds every endpoint request-rate or compute-unit capacity")
+        );
+        assert_eq!(budget.snapshot().total_admitted_rpc_calls, 0);
+        let requests = transport.endpoint_request_rate_snapshot().pop().unwrap();
+        assert_eq!(requests.total_admitted_rpc_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn compute_unit_budget_waits_once_units_run_out() {
+        let (url, server) = fixed_http_server(vec![
+            r#"{"jsonrpc":"2.0","id":33,"result":"0x"}"#,
+            r#"{"jsonrpc":"2.0","id":34,"result":"0x"}"#,
+        ]);
+        let budget = eth_call_budget(40);
+        let mut transport = LoadBalancedTransport::builder_with_endpoints(vec![
+            EndpointConfig::new(url, Weight(1)).with_compute_unit_budget(budget.clone()),
+        ])
+        .build();
+        let started_at = tokio::time::Instant::now();
+
+        transport
+            .call(RequestPacket::Single(rpc_call("eth_call", 33)))
+            .await
+            .unwrap();
+        transport
+            .call(RequestPacket::Single(rpc_call("eth_call", 34)))
+            .await
+            .unwrap();
+
+        assert!(started_at.elapsed() >= Duration::from_secs(1));
+        let snapshot = budget.snapshot();
+        assert_eq!(snapshot.total_admitted_rpc_calls, 2);
+        assert_eq!(snapshot.total_capacity_waits, 1);
+        assert!(transport.endpoint_request_rate_snapshot().is_empty());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transports_sharing_a_budget_draw_from_one_capacity() {
+        let (base_url, base_server) =
+            fixed_http_server(vec![r#"{"jsonrpc":"2.0","id":35,"result":"0x"}"#]);
+        let (eth_url, eth_server) =
+            fixed_http_server(vec![r#"{"jsonrpc":"2.0","id":36,"result":"0x"}"#]);
+        let account = eth_call_budget(30);
+        let transport_for = |url| {
+            LoadBalancedTransport::builder_with_endpoints(vec![
+                EndpointConfig::new(url, Weight(1)).with_compute_unit_budget(account.clone()),
+            ])
+            .build()
+        };
+        let mut base = transport_for(base_url);
+        let mut eth = transport_for(eth_url);
+        let started_at = tokio::time::Instant::now();
+
+        base.call(RequestPacket::Single(rpc_call("eth_call", 35)))
+            .await
+            .unwrap();
+        eth.call(RequestPacket::Single(rpc_call("eth_call", 36)))
+            .await
+            .unwrap();
+
+        assert!(started_at.elapsed() >= Duration::from_secs(1));
+        let snapshot = account.snapshot();
+        assert_eq!(snapshot.total_admitted_units, 52);
+        assert_eq!(snapshot.total_capacity_waits, 1);
+        base_server.join().unwrap();
+        eth_server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn json_rpc_rate_limit_error_is_retried_and_throttles_the_domain() {
+        let (url, server) = fixed_http_server_on(
+            "127.0.0.2",
+            vec![
+                r#"{"jsonrpc":"2.0","id":40,"error":{"code":429,"message":"Your app has exceeded its compute units per second capacity."}}"#,
+                r#"{"jsonrpc":"2.0","id":40,"result":"0x1"}"#,
+            ],
+        );
+        let mut transport = LoadBalancedTransport::builder(vec![(url, Weight(1))])
+            .config(BalancerConfig {
+                max_retry_rounds: 1,
+                initial_backoff: Duration::from_millis(1),
+                ..Default::default()
+            })
+            .build();
+
+        let response = transport
+            .call(RequestPacket::Single(rpc_call("eth_blockNumber", 40)))
+            .await
+            .unwrap();
+
+        assert!(!response.is_error());
+        assert_eq!(recorded_rate_limits(&transport), 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_json_rpc_rate_limit_surfaces_as_retryable_429() {
+        let (url, server) = fixed_http_server_on(
+            "127.0.0.3",
+            vec![r#"{"jsonrpc":"2.0","id":41,"error":{"code":429,"message":"capacity exceeded"}}"#],
+        );
+        let mut transport = LoadBalancedTransport::builder(vec![(url, Weight(1))])
+            .config(BalancerConfig {
+                max_retry_rounds: 0,
+                ..Default::default()
+            })
+            .build();
+
+        let error = transport
+            .call(RequestPacket::Single(rpc_call("eth_blockNumber", 41)))
+            .await
+            .unwrap_err();
+
+        assert!(LoadBalancedTransport::is_rate_limit(&error));
+        assert!(error.to_string().contains("capacity exceeded"));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn partially_rate_limited_batch_is_returned_and_throttles_the_domain() {
+        let (url, server) = fixed_http_server_on(
+            "127.0.0.4",
+            vec![
+                r#"[{"jsonrpc":"2.0","id":42,"result":"0x1"},{"jsonrpc":"2.0","id":43,"error":{"code":429,"message":"capacity exceeded"}}]"#,
+            ],
+        );
+        let mut transport = LoadBalancedTransport::builder(vec![(url, Weight(1))])
+            .config(BalancerConfig {
+                max_retry_rounds: 0,
+                ..Default::default()
+            })
+            .build();
+
+        let response = transport
+            .call(RequestPacket::Batch(vec![
+                rpc_call("eth_blockNumber", 42),
+                rpc_call("eth_chainId", 43),
+            ]))
+            .await
+            .unwrap();
+
+        assert_eq!(response.iter_errors().count(), 1);
+        assert_eq!(recorded_rate_limits(&transport), 1);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn other_json_rpc_errors_are_returned_without_retry() {
+        let (url, server) = fixed_http_server_on(
+            "127.0.0.5",
+            vec![
+                r#"{"jsonrpc":"2.0","id":44,"error":{"code":-32000,"message":"execution reverted"}}"#,
+            ],
+        );
+        let mut transport = LoadBalancedTransport::new(vec![(url, Weight(1))]);
+
+        let response = transport
+            .call(RequestPacket::Single(rpc_call("eth_call", 44)))
+            .await
+            .unwrap();
+
+        assert_eq!(response.first_error_code(), Some(-32000));
+        assert_eq!(recorded_rate_limits(&transport), 0);
+        server.join().unwrap();
     }
 }

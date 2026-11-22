@@ -94,6 +94,13 @@ pub struct DomainThrottleState {
     config: Arc<ThrottleConfig>,
 }
 
+#[cfg(test)]
+impl DomainThrottleState {
+    pub(crate) fn total_rate_limits(&self) -> u64 {
+        self.total_rate_limits.load(Ordering::Relaxed)
+    }
+}
+
 /// Process-wide domain throttle registry.
 ///
 /// Keyed by the "rate-limit group" extracted from the URL host (e.g. `alchemy.com`).

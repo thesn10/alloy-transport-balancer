@@ -109,6 +109,70 @@ consumer, or leave explicit headroom when other processes share the endpoint.
 Independently constructed balancers have independent budgets; reuse clones when
 one process must coordinate a shared endpoint quota.
 
+#### Compute-unit budgets
+
+Providers such as Alchemy meter throughput in compute units per second (CUPS)
+rather than calls, and per account rather than per URL. A `ComputeUnitBudget`
+models such a limit next to the request rate: every call consumes its compute
+units from the provider's cost table, a batch the sum of its members, and a
+packet is admitted only while both the endpoint's `max_requests_per_second` and
+its budget have room.
+
+`ComputeUnitBudget::alchemy(cups)` charges Alchemy's throughput compute units
+(`eth_call` 26, `eth_getStorageAt` 20, `eth_getLogs` 60, `debug_*` 1000, …; a
+method missing from the table counts as `eth_call`) and evaluates them over
+Alchemy's 10-second rolling window, so bursts up to ten seconds of budget are
+admitted as long as no 10-second period exceeds it.
+`ComputeUnitBudget::new(cost, units_per_second, window)` picks another window,
+e.g. one second for strictly smoothed traffic.
+
+The Alchemy table covers every JSON-RPC method of Alchemy's EVM products,
+including chain-specific ones (zkSync, Polygon, Linea, HyperEVM, …). An ignored
+test compares it with the published page:
+`cargo test --lib alchemy_table_matches_published_costs -- --ignored`.
+
+Clones of one budget share its capacity. Hand the same budget to every endpoint
+and transport that draws on one account, e.g. the Base and Ethereum transports
+of one process:
+
+```rust
+use alloy_transport_balancer::{ComputeUnitBudget, EndpointConfig, LoadBalancedTransport, Weight};
+use reqwest::Url;
+
+// Headroom below a 10,000 CUPS plan for other consumers of the account.
+let alchemy = ComputeUnitBudget::alchemy(8_000);
+
+let base = LoadBalancedTransport::builder_with_endpoints(vec![
+    EndpointConfig::new(Url::parse("https://base-mainnet.g.alchemy.com/v2/KEY").unwrap(), Weight(100))
+        .with_id("alchemy")
+        .with_compute_unit_budget(alchemy.clone()),
+    EndpointConfig::new(Url::parse("https://mainnet.base.org").unwrap(), Weight(50))
+        .with_id("public")
+        .with_max_requests_per_second(20),
+])
+.build();
+let eth = LoadBalancedTransport::builder_with_endpoints(vec![
+    EndpointConfig::new(Url::parse("https://eth-mainnet.g.alchemy.com/v2/KEY").unwrap(), Weight(100))
+        .with_compute_unit_budget(alchemy.clone()),
+])
+.build();
+
+let snapshot = alchemy.snapshot();
+assert_eq!(snapshot.capacity, 80_000);
+```
+
+Budgets live in one process; other processes on the same account need headroom
+of their own.
+
+#### JSON-RPC rate-limit errors
+
+Some providers answer a rate-limited call with HTTP 200 and a JSON-RPC error
+with code `429` (Alchemy does over WebSocket). A packet whose every response is
+such an error is treated like HTTP 429: it escalates the domain throttle and is
+retried or failed over. A batch where only some members carry the error is
+returned unchanged, since resending it would repeat the calls that succeeded,
+but it still escalates the domain throttle.
+
 ### Provider Affinity and Flashblocks
 
 Give endpoints stable, non-secret IDs when event provenance or provider-local
@@ -364,6 +428,7 @@ replace them with your own endpoints before measuring production behavior.
 | `max_request_bytes` | unrestricted | Largest serialized `RequestPacket` eligible for this endpoint |
 | `max_in_flight` | unrestricted | Per-endpoint semaphore bound; excess work waits without blocking other endpoints |
 | `max_requests_per_second` | unrestricted | JSON-RPC calls admitted in any rolling second; batch members count individually |
+| `compute_unit_budget` | none | Shared `ComputeUnitBudget` every call is charged against in its provider's compute units |
 | `flashblocks` | `false` | Whether the endpoint exposes a complete Flashblocks feed and matching pending state |
 
 ### `BatchingConfig`

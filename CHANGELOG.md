@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added `ComputeUnitBudget` and `EndpointConfig::with_compute_unit_budget`: a
+  compute-unit-per-second limit next to `max_requests_per_second`, charged from
+  a provider cost table (`ComputeUnitCost::Alchemy`) over a configurable rolling
+  window, and shared by every endpoint and transport holding a clone.
+  `ComputeUnitBudget::alchemy` uses Alchemy's 10-second window; `snapshot`
+  reports usage and cumulative admissions. An ignored test checks the Alchemy
+  table against Alchemy's published cost page.
+- A packet whose every response is a JSON-RPC error with code 429 is now retried
+  and escalates the domain throttle like HTTP 429; a partially rate-limited batch
+  is returned unchanged but still escalates the throttle.
+
+### Changed
+
+- `EndpointConfig` is `#[non_exhaustive]`: build it with `EndpointConfig::new`
+  and the `with_*` methods instead of a struct literal.
+
 ## [0.3.0] - 2026-09-05
 
 ### Changed
