@@ -137,7 +137,7 @@ of one process:
 
 ```rust
 use alloy_transport_balancer::{ComputeUnitBudget, EndpointConfig, LoadBalancedTransport, Weight};
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 
 // Headroom below a 10,000 CUPS plan for other consumers of the account.
 let alchemy = ComputeUnitBudget::alchemy(8_000);

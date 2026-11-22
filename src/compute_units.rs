@@ -579,9 +579,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "fetches Alchemy's published cost table"]
     async fn alchemy_table_matches_published_costs() {
-        let page = reqwest::get(ALCHEMY_COST_PAGE)
+        let page = crate::reqwest::get(ALCHEMY_COST_PAGE)
             .await
-            .and_then(reqwest::Response::error_for_status)
+            .and_then(crate::reqwest::Response::error_for_status)
             .expect("cost page is reachable")
             .text()
             .await
