@@ -478,7 +478,7 @@ impl Default for BalancerConfig {
 /// use alloy_transport_balancer::{
 ///     BalancerConfig, HttpClientConfig, LoadBalancedTransport, Weight,
 /// };
-/// use reqwest::Url;
+/// use alloy_transport_balancer::reqwest::Url;
 /// use std::time::Duration;
 ///
 /// let transport = LoadBalancedTransport::builder(vec![
@@ -763,7 +763,7 @@ impl LoadBalancedTransport {
     ///
     /// ```
     /// use alloy_transport_balancer::{LoadBalancedTransport, Weight, BalancerConfig};
-    /// use reqwest::Url;
+    /// use alloy_transport_balancer::reqwest::Url;
     ///
     /// let transport = LoadBalancedTransport::builder(vec![
     ///     (Url::parse("http://localhost:8545").unwrap(), Weight::default()),

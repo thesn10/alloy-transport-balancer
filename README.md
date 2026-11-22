@@ -30,7 +30,7 @@ Load-balanced, batching RPC transport for [alloy](https://github.com/alloy-rs/al
 
 ```rust
 use alloy_transport_balancer::{EndpointConfig, LoadBalancedTransport, Weight};
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 
 // Keep a smaller fallback in the pool without sending it oversized packets.
 let transport = LoadBalancedTransport::builder_with_endpoints(vec![
@@ -64,7 +64,7 @@ Use [`Weight`] to control traffic distribution. The default weight of 100 provid
 
 ```rust
 use alloy_transport_balancer::{LoadBalancedTransport, Weight};
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 
 let transport = LoadBalancedTransport::new(vec![
     (Url::parse("https://primary-provider.com").unwrap(), Weight(100)),   // ~63% of traffic
@@ -121,7 +121,7 @@ enumerate subscription variants in transport configuration.
 use alloy_transport_balancer::{
     EndpointConfig, FlashblocksProbeOutcome, LoadBalancedTransport, Weight,
 };
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 
 let transport = LoadBalancedTransport::builder_with_endpoints(vec![
     EndpointConfig::new(
@@ -178,7 +178,7 @@ Use the builder for full control over retry, throttle, and HTTP client behavior:
 use alloy_transport_balancer::{
     LoadBalancedTransport, Weight, BalancerConfig, ThrottleConfig, HttpClientConfig,
 };
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 use std::time::Duration;
 
 let transport = LoadBalancedTransport::builder(vec![
@@ -207,7 +207,7 @@ let transport = LoadBalancedTransport::builder(vec![
 
 ```rust,no_run
 use alloy_transport_balancer::{BatchingConfig, BatchingTransport, LoadBalancedTransport, Weight};
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 
 let inner = LoadBalancedTransport::new(vec![
     (Url::parse("https://eth.llamarpc.com").unwrap(), Weight::default()),
@@ -419,7 +419,7 @@ This prevents thundering herd scenarios where N threads independently discover a
 
 ```rust
 use alloy_transport_balancer::{LoadBalancedTransport, BatchingTransport, BatchingConfig, Weight};
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 
 // Alchemy endpoints across chains share one throttle state automatically
 let eth = LoadBalancedTransport::new(vec![
@@ -452,7 +452,7 @@ Wire domain throttle escalation into the batching layer:
 ```rust
 use alloy_transport_balancer::*;
 use std::sync::Arc;
-use reqwest::Url;
+use alloy_transport_balancer::reqwest::Url;
 
 let domain = "alchemy.com";
 let throttle = domain_throttle(domain);
